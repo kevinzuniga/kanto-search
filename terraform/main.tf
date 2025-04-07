@@ -36,21 +36,24 @@ resource "aws_elasticache_subnet_group" "redis" {
   subnet_ids = [aws_subnet.public.id]
 }
 
-resource "aws_elasticache_cluster" "valkey" {
-  cluster_id           = "valkey-cluster"
-  engine               = "valkey"
-  node_type            = "cache.t2.micro"
-  num_cache_nodes      = 1
-  parameter_group_name = "default.valkey7"
-  subnet_group_name    = aws_elasticache_subnet_group.redis.name
-  security_group_ids   = [aws_security_group.ecs_sg.id]
+resource "aws_elasticache_replication_group" "valkey" {
+  replication_group_id       = "valkey-cluster"
+  description                = "Valkey cluster for search app"
+  engine                     = "valkey"
+  engine_version             = "7.2"
+  node_type                  = "cache.t2.micro"
+  num_cache_clusters         = 1
+  parameter_group_name       = "default.valkey7"
+  subnet_group_name          = aws_elasticache_subnet_group.redis.name
+  security_group_ids         = [aws_security_group.ecs_sg.id]
+  automatic_failover_enabled = false
 }
 
 resource "aws_secretsmanager_secret" "redis" {
-  name = "valkey-redis-secret"
+  name = "valkey-redis-secret-tf"
 }
 
 resource "aws_secretsmanager_secret_version" "redis_version" {
   secret_id     = aws_secretsmanager_secret.redis.id
-  secret_string = jsonencode({ host = aws_elasticache_cluster.valkey.cache_nodes[0].address })
+  secret_string = jsonencode({ host = aws_elasticache_replication_group.valkey.primary_endpoint_address })
 }
