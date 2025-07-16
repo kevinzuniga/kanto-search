@@ -147,48 +147,35 @@ resource "aws_ecr_repository" "app" {
   force_delete = true  # For easier cleanup in POC
 }
 
-# ALB
-resource "aws_lb" "main" {
-  name               = "kanto-search-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = [aws_subnet.public_1.id, aws_subnet.public_2.id]
+# Create Secrets for OpenSearch and Redis
+resource "aws_secretsmanager_secret" "opensearch_secret" {
+  name = "opensearch-secret"
+  description = "OpenSearch credentials for Kanto Search"
 }
 
-resource "aws_lb_target_group" "app" {
-  name        = "kanto-search-tg"
-  port        = 3000
-  protocol    = "HTTP"
-  vpc_id      = aws_vpc.main.id
-  target_type = "ip"
-
-  health_check {
-    path                = "/search"
-    healthy_threshold   = 2
-    unhealthy_threshold = 10
-    timeout             = 5
-    interval            = 15
-    matcher            = "200-499"  # More permissive for POC
-  }
+resource "aws_secretsmanager_secret_version" "opensearch_secret_version" {
+  secret_id = aws_secretsmanager_secret.opensearch_secret.id
+  secret_string = jsonencode({
+    username = "admin"
+    password = "Admin123!"
+    host     = "https://search-kanto-prod--iitfloqgled4ypbtjq4t7ddqxa.us-east-1.es.amazonaws.com"
+  })
 }
 
-resource "aws_lb_listener" "app" {
-  load_balancer_arn = aws_lb.main.arn
-  port              = 80
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.app.arn
-  }
+# Create Redis Secret
+resource "aws_secretsmanager_secret" "redis_secret" {
+  name = "valkey-redis-secret"
+  description = "Redis/Valkey credentials for Kanto Search"
 }
 
-# ECS
-resource "aws_ecs_cluster" "main" {
-  name = "kanto-search-cluster"
+resource "aws_secretsmanager_secret_version" "redis_secret_version" {
+  secret_id = aws_secretsmanager_secret.redis_secret.id
+  secret_string = jsonencode({
+    host = aws_elasticache_replication_group.redis.primary_endpoint_address
+  })
 }
 
+# IAM Roles
 resource "aws_iam_role" "ecs_task_execution" {
   name = "kanto-search-ecs-execution"
 
@@ -228,25 +215,7 @@ resource "aws_iam_role" "ecs_task_role" {
   })
 }
 
-resource "aws_iam_role_policy" "secrets_access" {
-  name = "secrets-access"
-  role = aws_iam_role.ecs_task_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:DescribeSecret"
-        ]
-        Resource = ["*"]  # For POC. In production, specify exact secret ARNs
-      }
-    ]
-  })
-}
-
+# ECS Task Definition
 resource "aws_ecs_task_definition" "app" {
   family                   = "kanto-search"
   requires_compatibilities = ["FARGATE"]
@@ -271,8 +240,19 @@ resource "aws_ecs_task_definition" "app" {
       
       environment = [
         {
-          name  = "REDIS_HOST"
-          value = aws_elasticache_replication_group.redis.primary_endpoint_address
+          name  = "NODE_ENV"
+          value = "production"
+        }
+      ]
+      
+      secrets = [
+        {
+          name      = "OPENSEARCH_SECRET"
+          valueFrom = aws_secretsmanager_secret.opensearch_secret.arn
+        },
+        {
+          name      = "REDIS_SECRET"
+          valueFrom = aws_secretsmanager_secret.redis_secret.arn
         }
       ]
       
@@ -287,6 +267,56 @@ resource "aws_ecs_task_definition" "app" {
       }
     }
   ])
+}
+
+# IAM Role Policies
+resource "aws_iam_role_policy" "secrets_access" {
+  name = "secrets-access"
+  role = aws_iam_role.ecs_task_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
+        ]
+        Resource = [
+          aws_secretsmanager_secret.opensearch_secret.arn,
+          aws_secretsmanager_secret.redis_secret.arn
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "task_execution_secrets" {
+  name = "execution-secrets-access"
+  role = aws_iam_role.ecs_task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
+        ]
+        Resource = [
+          aws_secretsmanager_secret.opensearch_secret.arn,
+          aws_secretsmanager_secret.redis_secret.arn
+        ]
+      }
+    ]
+  })
+}
+
+# ECS Service
+resource "aws_ecs_cluster" "main" {
+  name = "kanto-search-cluster"
 }
 
 resource "aws_ecs_service" "app" {
@@ -306,6 +336,43 @@ resource "aws_ecs_service" "app" {
     target_group_arn = aws_lb_target_group.app.arn
     container_name   = "app"
     container_port   = 3000
+  }
+}
+
+# ALB
+resource "aws_lb" "main" {
+  name               = "kanto-search-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = [aws_subnet.public_1.id, aws_subnet.public_2.id]
+}
+
+resource "aws_lb_target_group" "app" {
+  name        = "kanto-search-tg"
+  port        = 3000
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"
+
+  health_check {
+    path                = "/search"
+    healthy_threshold   = 2
+    unhealthy_threshold = 10
+    timeout             = 5
+    interval            = 15
+    matcher            = "200-499"  # More permissive for POC
+  }
+}
+
+resource "aws_lb_listener" "app" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
   }
 }
 
